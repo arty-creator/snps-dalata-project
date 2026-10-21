@@ -1,0 +1,223 @@
+---
+title: "Caracterização genômica dos SNPs de *Dipteryx alata*"
+author: "Artur Gabriel Rodrigues Silva"
+output:
+html_document:
+toc: true
+toc_float: true
+code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Contexto
+
+Este documento parte do TSV gerado por `01_extract_snpeff_ann.sh`
+(colunas `CHROM`, `POS`, `ANN`) e produz um ideograma circular com um
+anel externo de cromossomos seguido de quatro anéis de densidade:
+total de SNPs, SNPs em CDS, SNPs missense e SNPs de alto impacto.
+
+vcfR é evitado propositalmente: para ~7 milhões de variantes, o objeto
+S4 que ele constrói em memória facilmente ultrapassa a RAM disponível.
+O gargalo é contornado em duas frentes: `bcftools` já reduziu o VCF a
+um TSV de 3 colunas na etapa anterior, e aqui `data.table` lê e
+processa esse TSV de forma vetorizada, com uma fração do tempo e da
+memória de um `data.frame`/vcfR equivalente.
+
+```{r pacotes}
+library(data.table)
+library(circlize)
+library(ComplexHeatmap)
+```
+
+## 1. Parâmetros
+
+```{r parametros}
+ann_file    <- "ann_raw.tsv"       # saída da etapa 01
+window_size <- 1e6                    # tamanho da janela genômica em pb (ajustar conforme genoma)
+chroms_keep <- NULL                   # ex.: c("Chr01","Chr02", ...) para restringir; NULL = todos 
+```
+
+## 2. Leitura do TSV bruto (CHROM, POS, ANN)
+
+```{r leitura}
+dt <- fread(
+  ann_file,
+  header    = FALSE,
+  sep       = "\t",
+  quote     = "",
+  col.names = c("CHROM", "POS", "ANN"),
+  na.strings = c("", ".")
+)
+
+# Alguns registros podem não ter anotação (ANN ausente); mantidos como
+# "sem anotação" nas contagens de total, mas excluídos das categorias
+# derivadas do campo ANN.
+dt[, has_ann := !is.na(ANN)]
+```
+
+## 3. Parsing do campo ANN
+
+Formato SnpEff (pipe-delimited), com múltiplas anotações por variante
+separadas por vírgula, uma por transcrito sobreposto. Por convenção do
+próprio SnpEff, a primeira anotação da lista é a de maior
+impacto/relevância, por isso é a única usada aqui, prática padrão para
+sumarização por variante.
+
+Campos relevantes no `ANN` (índice 1-based):
+
+- `2` `Annotation` (ex.: `missense_variant`, `synonymous_variant`, ...)
+- `3` `Annotation_Impact` (`HIGH` / `MODERATE` / `LOW` / `MODIFIER`)
+- `13` `CDS_pos/CDS_length` (não vazio implica variante dentro de um CDS)
+
+```{r parsing_ann}
+dt[has_ann == TRUE, ANN1 := sub(",.*", "", ANN)]
+
+ann_fields <- tstrsplit(dt$ANN1, "|", fixed = TRUE)
+
+dt[, Annotation := ann_fields[[2]]]
+dt[, Impact     := ann_fields[[3]]]
+dt[, CDS_pos    := ann_fields[[13]]]
+
+dt[, is_cds      := has_ann & !is.na(CDS_pos) & CDS_pos != ""]
+dt[, is_missense := has_ann & Annotation == "missense_variant"]
+dt[, is_high     := has_ann & Impact == "HIGH"]
+
+# Libera memória das colunas intermediárias antes do binning
+dt[, c("ANN", "ANN1") := NULL]
+```
+
+## 4. Binning em janelas genômicas por cromossomo
+
+```{r binning}
+dt[, bin_start := (POS %/% window_size) * window_size]
+
+density_dt <- dt[, .(
+  total    = .N,
+  cds      = sum(is_cds),
+  missense = sum(is_missense),
+  high     = sum(is_high)
+), by = .(CHROM, bin_start)]
+
+density_dt[, bin_end := bin_start + window_size]
+setorder(density_dt, CHROM, bin_start)
+
+rm(dt); gc()
+```
+
+## 5. Comprimentos dos cromossomos
+
+Necessários para inicializar os setores do `circlize`. Definidos
+diretamente aqui, sem depender de um `.fai` externo.
+
+```{r comprimentos}
+chr_lengths <- data.frame(
+  chr = c("Dal_01", "Dal_02", "Dal_03", "Dal_04",
+          "Dal_05", "Dal_06", "Dal_07", "Dal_08"),
+  len = c(109235506, 96872974, 91979233, 89179258,
+          81750530, 77802829, 76427835, 75553200)
+)
+
+if (!is.null(chroms_keep)) {
+  chr_lengths <- chr_lengths[chr_lengths$chr %in% chroms_keep, ]
+  density_dt  <- density_dt[CHROM %in% chroms_keep]
+}
+
+chr_df <- data.frame(chr = chr_lengths$chr, start = 0, end = chr_lengths$len)
+```
+
+## 6. Data.frames "bed-like" para o circlize
+
+```{r bed}
+make_bed <- function(value_col) {
+  data.frame(
+    chr   = density_dt$CHROM,
+    start = density_dt$bin_start,
+    end   = density_dt$bin_end,
+    value = density_dt[[value_col]]
+  )
+}
+
+bed_total    <- make_bed("total")
+bed_cds      <- make_bed("cds")
+bed_missense <- make_bed("missense")
+bed_high     <- make_bed("high")
+```
+
+## 7. Plot circular
+
+```{r plot, fig.width=8, fig.height=8}
+par(mar = c(1, 1, 3, 1))
+circos.clear()
+circos.par(gap.degree = 1.5, start.degree = 90, track.height = 0.12)
+
+# Anel externo: ideograma dos cromossomos
+circos.genomicInitialize(chr_df, plotType = c("axis", "labels"), track.height = 0.05)
+
+# Função utilitária para cada anel de densidade. 
+add_density_track <- function(bed, color) {
+  circos.genomicTrackPlotRegion(
+    bed,
+    ylim = c(0, max(bed$value, na.rm = TRUE)),
+    panel.fun = function(region, value, ...) {
+      circos.genomicLines(region, value, type = "h", col = color, lwd = 1.2, area = TRUE)})}
+
+track_labels <- c("Total SNPs", "CDS SNPs", "Missense", "High-impact")
+track_colors <- c("#0072B2", "#E69F00", "#009E73", "#D55E00")
+
+
+add_density_track(bed_total,    track_colors[1])
+add_density_track(bed_cds,      track_colors[2])
+add_density_track(bed_missense, track_colors[3])
+add_density_track(bed_high,     track_colors[4])
+
+# Legenda 
+
+legend("top",
+       legend = track_labels,
+       col = track_colors,
+       pch = 15,
+       pt.cex = 1.5,
+       horiz = TRUE,
+       bty = "n",
+       cex = 0.8,
+       title = "Categoria",
+       inset = c(0, -0.05))
+```
+
+
+## 8. Exportar a tabela agregada
+
+Permite inspecionar os valores ou refazer o plot sem reprocessar o TSV
+inteiro.
+
+```{r export}
+fwrite(density_dt, "snp_density_by_window.tsv", sep = "\t")
+```
+
+## 9. Salvar como pdf
+
+```{r}
+pdf("figura_SNPs_circos.pdf", width = 8, height = 8)
+
+par(mar = c(1, 1, 3, 1))
+circos.clear()
+circos.par(gap.degree = 1.5, start.degree = 90, track.height = 0.12)
+
+circos.genomicInitialize(chr_df, plotType = c("axis", "labels"))
+
+# resto do seu código...
+add_density_track(bed_total, track_colors[1])
+add_density_track(bed_cds, track_colors[2])
+add_density_track(bed_missense, track_colors[3])
+add_density_track(bed_high, track_colors[4])
+
+legend("top", legend = track_labels, fill = track_colors,
+       border = NA, bty = "n", horiz = TRUE, cex = 0.8)
+
+circos.clear()
+dev.off()
+```
+

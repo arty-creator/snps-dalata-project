@@ -1,0 +1,429 @@
+---
+title: "tasse_SNP_analysis"
+output: html_notebook
+---
+
+> Artur Silva - PPGGMP 17/08/26
+
+```{r}
+library(dplyr)
+library(tibble)
+library(tidyverse)
+```
+
+
+```{r setup, include=FALSE}
+dados <- read.delim("no_maf/dalata_diversity_slidingwindow1.xlsx",
+  sep = "\t",
+  header = TRUE,
+  stringsAsFactors = FALSE) %>%
+  mutate(
+    across(
+      c(PiPerBP, ThetaPerBP, TajimaD),
+      ~ as.numeric(gsub(",", ".", .))))
+```
+
+```{r}
+dados2 <- read.delim("no_maf/analise_exploratoria.lmiss",
+  sep = "\t",
+  header = TRUE,
+  stringsAsFactors = FALSE) %>%
+  mutate(
+    across(
+      c(F_MISS),
+      ~ as.numeric(gsub(",", ".", .))))
+```
+
+```{r}
+dados3 <- read.delim("no_maf/analise_exploratoria.ldepth.mean",
+  sep = "\t",
+  header = TRUE,
+  stringsAsFactors = FALSE) %>%
+  mutate(
+    across(
+      c(MEAN_DEPTH),
+      ~ as.numeric(gsub(",", ".", .))))
+```
+
+
+# Estatística descritiva
+
+```{r}
+dados %>%
+  select(PiPerBP, ThetaPerBP, TajimaD) %>%
+  summary()
+cat(" SD Pi:", sd(dados$PiPerBP, na.rm = TRUE), "\n")
+cat(" SD Theta:", sd(dados$ThetaPerBP, na.rm = TRUE), "\n")
+cat(" SD D:", sd(dados$TajimaD, na.rm = TRUE), "\n")
+
+dados2 %>%
+  select(F_MISS) %>%
+  summary()
+cat(" SD F_MISS:", sd(dados2$F_MISS), "\n")
+
+dados3 %>%
+  select(MEAN_DEPTH) %>%
+  summary()
+cat(" SD MEAN_DEPTH", sd(dados3$MEAN_DEPTH), "\n")
+```
+
+
+```{r, fig.width=12, fig.height=4}
+labels_estat <- c(
+  PiPerBP    = "π (Nucleotide diversity)",
+  ThetaPerBP = "θ (Watterson's theta)",
+  TajimaD    = "Tajima's D"
+)
+
+# Paleta - ajuste as cores livremente
+cores_estat <- c(
+  PiPerBP    = "#CC79A7",
+  ThetaPerBP = "#E69F00",
+  TajimaD    = "#009E73"
+)
+
+p <- dados %>%
+  select(PiPerBP, ThetaPerBP, TajimaD) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "Estatistica",
+    values_to = "Valor"
+  ) %>%
+  ggplot(aes(x = Valor, fill = Estatistica)) +
+  geom_histogram(
+    bins = 50,
+    color = "black",
+    linewidth = 0.3
+  ) +
+  facet_wrap(
+    ~ Estatistica,
+    scales = "free",
+    labeller = labeller(Estatistica = labels_estat)
+  ) +
+  scale_fill_manual(values = cores_estat) +
+  labs(
+    x = NULL,
+    y = "Number of windows"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 11, color = "black"),
+    axis.text = element_text(color = "black", size = 10),
+    axis.title = element_text(color = "black", size = 12),
+    axis.line = element_line(color = "black", linewidth = 0.4),
+    axis.ticks = element_line(color = "black", linewidth = 0.4),
+    panel.spacing = unit(1.2, "lines"),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+p
+
+ggsave(
+  "figura_diversidade_janelas.tiff",
+  plot = p,
+  width = 180,
+  height = 70,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw"
+)
+```
+
+## Por cromossomo
+
+```{r, fig.width=7, fig.height=7}
+library(ggh4x)
+
+labels_estat <- c(
+  PiPerBP    = "π (Nucleotide diversity)",
+  ThetaPerBP = "θ (Watterson's theta)",
+  TajimaD    = "Tajima's D"
+)
+
+cores_estat <- c(
+  PiPerBP    = "#CC79A7",
+  ThetaPerBP = "#E69F00",
+  TajimaD    = "#009E73"
+)
+
+dados_long <- dados %>%
+  select(Chromosome, PiPerBP, ThetaPerBP, TajimaD) %>%
+  pivot_longer(
+    cols = c(PiPerBP, ThetaPerBP, TajimaD),
+    names_to = "Estatistica",
+    values_to = "Valor"
+  )
+
+lims <- dados_long %>%
+  group_by(Estatistica) %>%
+  summarise(
+    lo = quantile(Valor, 0.01, na.rm = TRUE),
+    hi = quantile(Valor, 0.99, na.rm = TRUE)
+  )
+
+p_chr <- dados_long %>%
+  ggplot(aes(x = Chromosome, y = Valor, fill = Estatistica)) +
+  geom_boxplot(
+    outlier.size = 0.6,
+    outlier.alpha = 0.4,
+    color = "black",
+    linewidth = 0.3
+  ) +
+  facet_wrap(
+    ~ Estatistica,
+    scales = "free_y",
+    labeller = labeller(Estatistica = labels_estat),
+    ncol = 1
+  ) +
+  facetted_pos_scales(
+    y = list(
+      Estatistica == "PiPerBP"    ~ scale_y_continuous(limits = c(lims$lo[lims$Estatistica=="PiPerBP"],    lims$hi[lims$Estatistica=="PiPerBP"])),
+      Estatistica == "ThetaPerBP" ~ scale_y_continuous(limits = c(lims$lo[lims$Estatistica=="ThetaPerBP"], lims$hi[lims$Estatistica=="ThetaPerBP"])),
+      Estatistica == "TajimaD"    ~ scale_y_continuous(limits = c(lims$lo[lims$Estatistica=="TajimaD"],    lims$hi[lims$Estatistica=="TajimaD"]))
+    )
+  ) +
+  scale_fill_manual(values = cores_estat) +
+  labs(x = "Chromosome", y = NULL) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 11, color = "black"),
+    axis.text.x = element_text(color = "black", size = 9, angle = 45, hjust = 1),
+    axis.text.y = element_text(color = "black", size = 10),
+    axis.title = element_text(color = "black", size = 12),
+    axis.line = element_line(color = "black", linewidth = 0.4),
+    axis.ticks = element_line(color = "black", linewidth = 0.4),
+    panel.spacing = unit(1, "lines"),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+p_chr
+
+ggsave(
+  "figura_diversidade_por_cromossomo.tiff",
+  plot = p_chr,
+  width = 180,
+  height = 200,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw"
+)
+```
+
+## Por cromossomo
+
+```{r, fig.width=10, fig.height=7}
+labels_estat <- c(
+  PiPerBP    = "π (Nucleotide diversity)",
+  ThetaPerBP = "θ (Watterson's theta)",
+  TajimaD    = "Tajima's D"
+)
+
+# 1. Índice sequencial da janela dentro de cada cromossomo
+dados_pos <- dados %>%
+  select(Chromosome, PiPerBP, ThetaPerBP, TajimaD) %>%
+  mutate(Chromosome = factor(Chromosome, levels = unique(Chromosome))) %>%
+  group_by(Chromosome) %>%
+  mutate(Pos = row_number()) %>%
+  ungroup()
+
+# 2. Offset cumulativo para eixo x genômico contínuo
+chr_offsets <- dados_pos %>%
+  group_by(Chromosome) %>%
+  summarise(max_pos = max(Pos), .groups = "drop") %>%
+  mutate(offset = lag(cumsum(as.numeric(max_pos)), default = 0))
+
+dados_pos <- dados_pos %>%
+  left_join(chr_offsets %>% select(Chromosome, offset), by = "Chromosome") %>%
+  mutate(GenomePos = Pos + offset)
+
+# 3. Posição central de cada cromossomo, para os rótulos do eixo x
+eixo_chr <- dados_pos %>%
+  group_by(Chromosome) %>%
+  summarise(center = mean(GenomePos), .groups = "drop")
+
+# 4. Formato longo
+dados_long <- dados_pos %>%
+  select(Chromosome, GenomePos, PiPerBP, ThetaPerBP, TajimaD) %>%
+  pivot_longer(
+    cols = c(PiPerBP, ThetaPerBP, TajimaD),
+    names_to = "Estatistica",
+    values_to = "Valor"
+  )
+
+dados_long <- dados_long %>%
+  mutate(Estatistica = factor(Estatistica, levels = c("PiPerBP", "ThetaPerBP", "TajimaD")))
+
+# 5. Máximo, mínimo e mediana globais por métrica (linhas de referência)
+stats_linhas <- dados_long %>%
+  group_by(Estatistica) %>%
+  summarise(
+    Maximo  = max(Valor, na.rm = TRUE),
+    Minimo  = min(Valor, na.rm = TRUE),
+    Mediana = median(Valor, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+dados_long <- dados_long %>%
+  left_join(stats_linhas, by = "Estatistica")
+
+# 6. Paleta com uma cor por cromossomo
+n_chr <- nlevels(dados_pos$Chromosome)
+paleta_chr <- hcl.colors(n_chr, palette = "Dark 3")
+names(paleta_chr) <- levels(dados_pos$Chromosome)
+
+p_chr <- dados_long %>%
+  ggplot(aes(x = GenomePos, y = Valor, color = Chromosome)) +
+  geom_point(size = 0.5, alpha = 0.6, show.legend = FALSE) +
+  geom_hline(aes(yintercept = Maximo), color = "darkblue", linewidth = 0.5) +
+  geom_hline(aes(yintercept = Minimo), color = "red", linewidth = 0.5) +
+  geom_hline(aes(yintercept = Mediana), color = "black", linewidth = 0.5, linetype = "dashed") +
+  facet_wrap(
+    ~ Estatistica,
+    scales = "free_y",
+    labeller = labeller(Estatistica = labels_estat),
+    ncol = 1
+  ) +
+  scale_color_manual(values = paleta_chr) +
+  scale_x_continuous(
+    breaks = eixo_chr$center,
+    labels = eixo_chr$Chromosome,
+    expand = c(0.01, 0.01)
+  ) +
+  labs(x = "Chromosome", y = NULL) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 11, color = "black"),
+    axis.text.x = element_text(color = "black", size = 9),
+    axis.ticks.x = element_blank(),
+    axis.text.y = element_text(color = "black", size = 10),
+    axis.title = element_text(color = "black", size = 12),
+    axis.line = element_line(color = "black", linewidth = 0.4),
+    panel.spacing = unit(1, "lines"),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+p_chr
+
+ggsave(
+  "figura_diversidade_por_cromossomo.tiff",
+  plot = p_chr,
+  width = 240,
+  height = 200,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw"
+)
+```
+
+# Profundidade por indivíduo
+
+```{r, fig.width=7, fig.height=5}
+library(ggplot2)
+library(readr)
+library(dplyr)
+
+# ---- 1. Ler dados ----
+depth <- read_tsv(
+  "profundidade_individuo.idepth",
+  show_col_types = FALSE
+)
+
+# ---- 2. Estatísticas descritivas (calculadas a partir dos dados) ----
+q1  <- quantile(depth$MEAN_DEPTH, 0.25, na.rm = TRUE)
+med <- median(depth$MEAN_DEPTH, na.rm = TRUE)
+avg <- mean(depth$MEAN_DEPTH, na.rm = TRUE)
+q3  <- quantile(depth$MEAN_DEPTH, 0.75, na.rm = TRUE)
+n_ind <- nrow(depth)
+
+# ---- 3. Ordenar indivíduos pela profundidade ----
+depth <- depth %>%
+  arrange(MEAN_DEPTH) %>%
+  mutate(INDV = factor(INDV, levels = INDV))
+
+x_max <- ceiling(max(depth$MEAN_DEPTH, na.rm = TRUE)) + 1
+
+# ---- 4. Gráfico ----
+p <- ggplot(depth, aes(x = MEAN_DEPTH, y = INDV)) +
+  # Região entre Q1 e Q3
+  annotate(
+    "rect",
+    xmin = q1, xmax = q3, ymin = -Inf, ymax = Inf,
+    fill = "grey85", alpha = 0.5
+  ) +
+  # Linhas individuais
+  geom_segment(
+    aes(x = 0, xend = MEAN_DEPTH, yend = INDV),
+    linewidth = 0.45, color = "grey65"
+  ) +
+  # Mediana e média (com legenda própria em vez de linhas "mudas")
+  geom_vline(
+    aes(xintercept = med, linetype = "Median"),
+    linewidth = 0.6, color = "grey20"
+  ) +
+  geom_vline(
+    aes(xintercept = avg, linetype = "Mean"),
+    linewidth = 0.6, color = "grey20"
+  ) +
+  scale_linetype_manual(
+    name = NULL,
+    values = c("Median" = "dashed", "Mean" = "dotted")
+  ) +
+  # Pontos
+  geom_point(size = 3, color = "#D55E00") +
+  labs(
+    x = "Genotyped loci mean sequencing depth (×)",
+    y = NULL,
+    caption = sprintf(
+      "n = %d individuals; grey band = IQR",
+      n_ind, q1, q3
+    )
+  ) +
+  scale_x_continuous(
+    limits = c(0, x_max),
+    breaks = seq(0, x_max, 2),
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.y  = element_text(size = 8),
+    axis.text.x  = element_text(size = 9),
+    axis.title.x = element_text(size = 11, margin = margin(t = 6)),
+    axis.line.y  = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.grid.major.x = element_line(linewidth = 0.3, color = "grey90"),
+    panel.grid.minor    = element_blank(),
+    legend.position   = "bottom",
+    legend.margin     = margin(t = -8),
+    legend.text       = element_text(size = 9),
+    plot.caption      = element_text(size = 8, color = "grey30", hjust = 0),
+    plot.margin       = margin(t = 8, r = 10, b = 5, l = 5)
+  )
+
+# Mostrar
+print(p)
+
+# ---- 5. Salvar ----
+ggsave(
+  "profundidade_media_por_individuo.png",
+  plot = p, width = 7.5, height = 6, units = "in", dpi = 600, bg = "white"
+)
+
+ggsave(
+  "profundidade_media_por_individuo.pdf",
+  plot = p, width = 7.5, height = 6, units = "in"
+)
+
+# TIFF costuma ser exigido por alguns periódicos (ex.: 300 dpi, compressão LZW)
+# ggsave(
+#   "profundidade_media_por_individuo.tiff",
+#   plot = p, width = 7.5, height = 6, units = "in", dpi = 300,
+#   compression = "lzw", bg = "white"
+# )
+```
+
