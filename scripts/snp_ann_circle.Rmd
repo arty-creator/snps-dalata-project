@@ -2,10 +2,10 @@
 title: "Caracterização genômica dos SNPs de *Dipteryx alata*"
 author: "Artur Gabriel Rodrigues Silva"
 output:
-html_document:
-toc: true
-toc_float: true
-code_folding: show
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
 ---
 
 ```{r setup, include=FALSE}
@@ -146,6 +146,66 @@ bed_missense <- make_bed("missense")
 bed_high     <- make_bed("high")
 ```
 
+## 6b. Profundidade de cobertura (mosdepth)
+
+Leitura dos arquivos `*.regions.bed` do mosdepth, um por amostra, com a
+profundidade média entre amostras em janelas largas. O anel é desenhado
+como um mapa de calor (retângulos coloridos por `colorRamp2`), para se
+distinguir das barras dos anéis de SNPs.
+
+```{r cobertura}
+cov_dir    <- "."     # pasta com os *.regions.bed
+cov_window <- 2e6     # janela do anel de cobertura em pb (aumente para blocos mais largos)
+
+cov_files <- list.files(cov_dir, pattern = "\\.regions\\.bed(\\.gz)?$", full.names = TRUE)
+print(basename(cov_files))                  # confira visualmente
+stopifnot(length(cov_files) > 0)
+
+# lê uma amostra e calcula a profundidade média por janela grande
+media_por_janela <- function(f) {
+  x <- fread(f, header = FALSE, col.names = c("chr", "start", "end", "depth"))
+  x <- x[chr %in% chr_df$chr]               # descarta scaffolds fora dos 8 cromossomos
+  x[, bin_start := (start %/% cov_window) * cov_window]
+  x[, .(depth = mean(depth)), by = .(chr, bin_start)]
+}
+
+# média entre amostras, por janela
+cov_dt <- rbindlist(lapply(cov_files, media_por_janela))
+cov_dt <- cov_dt[, .(value = mean(depth)), by = .(chr, bin_start)]
+setorder(cov_dt, chr, bin_start)
+
+bed_cov <- data.frame(
+  chr   = cov_dt$chr,
+  start = cov_dt$bin_start,
+  end   = cov_dt$bin_start + cov_window,
+  value = cov_dt$value
+)
+
+# a última janela de cada cromossomo não pode passar do comprimento dele
+bed_cov$end <- pmin(bed_cov$end, chr_lengths$len[match(bed_cov$chr, chr_lengths$chr)])
+
+# escala de cor de 0 ao percentil 99, para picos isolados não achatarem a escala
+cov_max       <- quantile(bed_cov$value, 0.99, na.rm = TRUE)
+bed_cov$value <- pmin(bed_cov$value, cov_max)
+cov_col_fun   <- colorRamp2(c(0, cov_max), c("#F4ECF7", "#6A3D9A"))
+
+# função do anel de cobertura (retângulos coloridos pelo valor)
+add_coverage_track <- function(bed) {
+  circos.genomicTrackPlotRegion(
+    bed,
+    ylim = c(0, 1),
+    panel.fun = function(region, value, ...) {
+      circos.genomicRect(region, value, ytop = 1, ybottom = 0,
+                         col = cov_col_fun(value[[1]]), border = NA)})}
+
+# legenda em gradiente do anel de cobertura (ComplexHeatmap::Legend + draw)
+add_coverage_legend <- function() {
+  lgd_cov <- Legend(col_fun = cov_col_fun, title = "Cobertura média (X)")
+  draw(lgd_cov, x = grid::unit(1, "npc") - grid::unit(2, "mm"),
+       y = grid::unit(4, "mm"), just = c("right", "bottom"))
+}
+```
+
 ## 7. Plot circular
 
 ```{r plot, fig.width=8, fig.height=8}
@@ -155,6 +215,9 @@ circos.par(gap.degree = 1.5, start.degree = 90, track.height = 0.12)
 
 # Anel externo: ideograma dos cromossomos
 circos.genomicInitialize(chr_df, plotType = c("axis", "labels"), track.height = 0.05)
+
+# Anel de cobertura (primeira trilha de dados, a mais externa)
+add_coverage_track(bed_cov)
 
 # Função utilitária para cada anel de densidade. 
 add_density_track <- function(bed, color) {
@@ -185,6 +248,13 @@ legend("top",
        cex = 0.8,
        title = "Categoria",
        inset = c(0, -0.05))
+
+# Legenda do anel de cobertura (gradiente)
+add_coverage_legend <- function() {
+  lgd_cov <- Legend(col_fun = cov_col_fun, title = "Mean Depth (X)")
+  ComplexHeatmap::draw(lgd_cov, x = grid::unit(1, "npc") - grid::unit(2, "mm"),
+                       y = grid::unit(4, "mm"), just = c("right", "bottom"))
+}
 ```
 
 
@@ -208,6 +278,9 @@ circos.par(gap.degree = 1.5, start.degree = 90, track.height = 0.12)
 
 circos.genomicInitialize(chr_df, plotType = c("axis", "labels"))
 
+# Anel de cobertura (primeira trilha de dados, a mais externa)
+add_coverage_track(bed_cov)
+
 # resto do seu código...
 add_density_track(bed_total, track_colors[1])
 add_density_track(bed_cds, track_colors[2])
@@ -217,7 +290,9 @@ add_density_track(bed_high, track_colors[4])
 legend("top", legend = track_labels, fill = track_colors,
        border = NA, bty = "n", horiz = TRUE, cex = 0.8)
 
+# Legenda do anel de cobertura (gradiente)
+add_coverage_legend()
+
 circos.clear()
 dev.off()
 ```
-
