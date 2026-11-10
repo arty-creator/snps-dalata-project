@@ -1,0 +1,123 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(vcfR)
+library(dplyr)
+library(tidyr)
+```
+
+# Ler VCF
+
+```{r}
+vcf <- read.vcfR("snps_dalata_annotated.norepeats60.vcf.gz")
+```
+
+# Extrair campos INFO
+
+```{r}
+info_raw <- extract_info_tidy(vcf, info_fields = c("AF", "AC", "AN", "DP"))
+fix_df   <- as.data.frame(getFIX(vcf), stringsAsFactors = FALSE)
+
+info <- tibble(
+  QUAL = as.numeric(fix_df$QUAL),
+  AF   = as.numeric(sub(",.*", "", as.character(info_raw$AF))),  # 1º alelo ALT
+  AC   = as.numeric(sub(",.*", "", as.character(info_raw$AC))),  # 1º alelo ALT
+  AN   = as.numeric(info_raw$AN),
+  DP   = as.numeric(info_raw$DP)
+)
+```
+
+# Extraindo GT
+
+```{r}
+dp_gt <- extract.gt(vcf, element = "DP", as.numeric = TRUE)
+dim(dp_gt)
+```
+
+
+# Densidade por cromossomo
+
+```{r}
+# Comprimento dos cromossomos (bp)
+chr_lengths <- data.frame(
+  chr = c("Dal_01", "Dal_02", "Dal_03", "Dal_04",
+          "Dal_05", "Dal_06", "Dal_07", "Dal_08"),
+  len = c(109235506, 96872974, 91979233, 89179258,
+          81750530, 77802829, 76427835, 75553200)
+)
+
+# Contagem de variantes por cromossomo
+variants_chr <- as.data.frame(getFIX(vcf)) %>%
+  count(CHROM, name = "Variants") %>%
+  rename(chr = CHROM)
+
+# Tabela de densidade de variantes
+chr_summary <- chr_lengths %>%
+  left_join(variants_chr, by = "chr") %>%
+  mutate(
+    Variants = replace_na(Variants, 0),
+    `Variants/Mb` = Variants / (len / 1e6)
+  ) %>%
+  transmute(
+    Chromosome = chr,
+    Length = len,
+    Variants,
+    `Variants/Mb` = round(`Variants/Mb`, 2)
+  )
+
+# Adicionar linha Total
+chr_summary <- bind_rows(
+  chr_summary,
+  chr_summary %>%
+    summarise(
+      Chromosome = "Total",
+      Length = sum(Length),
+      Variants = sum(Variants),
+      `Variants/Mb` = round(Variants / (Length / 1e6), 2)
+    )
+)
+
+# Exibir tabela
+print(chr_summary)
+```
+
+
+# Resumo estatístico
+
+```{r}
+resumo <- info %>%
+  select(any_of(c("QUAL", "AF", "AC", "AN", "DP"))) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "Metrica",
+    values_to = "Valor"
+  ) %>%
+  group_by(Metrica) %>%
+  summarise(
+    N = sum(!is.na(Valor)),
+    Media = mean(Valor, na.rm = TRUE),
+    Mediana = median(Valor, na.rm = TRUE),
+    Minimo = min(Valor, na.rm = TRUE),
+    Maximo = max(Valor, na.rm = TRUE),
+    SD = sd(Valor, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(resumo)
+```
+
+```{r}
+#O DP do campo INFO é a profundidade total por locus, somada entre as amostras (média de 223,6 leituras). 
+#O DP do campo FORMAT é reportado por genótipo, e sua média entre amostras em cada locus (rowMeans) dá a 
+#profundidade média por indivíduo (9,39x), medida independente do número de amostras e adequada para descrever a cobertura do conjunto de dados.
+
+# Média do FORMAT/DP entre amostras, por locus
+info$DP_medio_gt <- rowMeans(dp_gt, na.rm = TRUE)
+
+summary(info$DP_medio_gt)
+sd(info$DP_medio_gt, na.rm = TRUE)
+```
+

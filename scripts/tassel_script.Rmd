@@ -13,7 +13,7 @@ library(tidyverse)
 
 
 ```{r setup, include=FALSE}
-dados <- read.delim("no_maf/dalata_diversity_slidingwindow1.xlsx",
+dados <- read.delim("no_maf_no_repeat/dalata_sliding_window_norepeat.txt",
   sep = "\t",
   header = TRUE,
   stringsAsFactors = FALSE) %>%
@@ -24,7 +24,7 @@ dados <- read.delim("no_maf/dalata_diversity_slidingwindow1.xlsx",
 ```
 
 ```{r}
-dados2 <- read.delim("no_maf/analise_exploratoria.lmiss",
+dados2 <- read.delim("no_maf_no_repeat/analise_exploratoria_no_repeat.lmiss",
   sep = "\t",
   header = TRUE,
   stringsAsFactors = FALSE) %>%
@@ -35,7 +35,7 @@ dados2 <- read.delim("no_maf/analise_exploratoria.lmiss",
 ```
 
 ```{r}
-dados3 <- read.delim("no_maf/analise_exploratoria.ldepth.mean",
+dados3 <- read.delim("no_maf_no_repeat/analise_exploratoria_no_repeat.ldepth.mean",
   sep = "\t",
   header = TRUE,
   stringsAsFactors = FALSE) %>%
