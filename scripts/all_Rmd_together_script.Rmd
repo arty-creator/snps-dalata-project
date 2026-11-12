@@ -1,0 +1,1210 @@
+---
+title: "Pipeline integrado de caracterização de SNPs de *Dipteryx alata*"
+author: "Artur Gabriel Rodrigues Silva"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+<!--
+MAPA DE ORIGEM (script original -> seção deste pipeline)
+  est_desc_snp_vcf.Rmd           -> seção 2 (VCF, DP, densidade por cromossomo)
+  desc_snps.Rmd                  -> absorvido na seção 2 (resumo idêntico ao de est_desc_snp_vcf.Rmd)
+  tassel_script.Rmd              -> seções 3 e 4 (sem F_MISS e sem MEAN_DEPTH por sítio)
+  anno_desc_snp.Rmd              -> seção 5
+  caracterizacao_snps_circos.Rmd -> seção 6
+  snp_ann_circle.Rmd             -> versão anterior da seção 6, totalmente substituída
+
+RENOMEAÇÕES (nome original -> nome neste pipeline)
+  info (est_desc)                -> info_vcf        (colidia com o `info` de anno_desc_snp)
+  info (anno_desc)               -> fix_df          (unificado com o fix_df de est_desc)
+  dados                          -> div_win
+  dados_long (boxplot)           -> div_long_chr
+  dados_long (genoma)            -> div_long_gen
+  dados_pos                      -> div_pos
+  p / p_chr (tassel)             -> p_div_hist, p_div_box, p_div_genoma, p_depth
+  dt (circos)                    -> dt_ann
+  chr_lengths filtrado (circos)  -> chr_lengths_circ
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# 1. Pacotes, entradas e parâmetros globais
+
+```{r pacotes}
+library(tidyverse)        # dplyr, tidyr, ggplot2, readr, stringr, purrr, tibble
+library(data.table)       # carregado depois do tidyverse (mascara dplyr::between/first/last, não usados)
+library(vcfR)
+library(DT)
+library(ggh4x)
+library(circlize)
+library(ComplexHeatmap)
+```
+
+```{r parametros}
+# ---- Entradas ----
+vcf_file    <- "no_maf_no_repeat/snps_dalata_annotated.norepeats60.vcf.gz"
+div_file    <- "no_maf_no_repeat/dalata_sliding_window_norepeat.txt"
+idepth_file <- "no_maf_no_repeat/out.idepth"
+ann_file    <- "no_maf_no_repeat/ann_norepeats60_final.tsv.gz"   # saída da etapa 01 (CHROM, POS, ANN)
+cov_dir     <- "."                                               # pasta com os *.regions.bed (mosdepth)
+
+# ---- Parâmetros do ideograma circular ----
+window_size <- 1e6       # tamanho da janela genômica em pb (ajustar conforme genoma)
+cov_window  <- 2e6       # janela do anel de cobertura em pb (aumente para blocos mais largos)
+chroms_keep <- NULL      # ex.: c("Dal_01","Dal_02", ...) para restringir; NULL = todos
+
+# ---- Comprimento dos cromossomos (bp), definido uma única vez ----
+chr_lengths <- data.frame(
+  chr = c("Dal_01", "Dal_02", "Dal_03", "Dal_04",
+          "Dal_05", "Dal_06", "Dal_07", "Dal_08"),
+  len = c(109235506, 96872974, 91979233, 89179258,
+          81750530, 77802829, 76427835, 75553200)
+)
+
+# ---- Paletas e rótulos compartilhados ----
+impact_levels <- c("HIGH", "MODERATE", "LOW", "MODIFIER")
+impact_cols   <- c("HIGH" = "#d62728", "MODERATE" = "#ff7f0e",
+                   "LOW"  = "#2ca02c", "MODIFIER" = "#1f77b4")
+
+labels_estat <- c(
+  PiPerBP    = "π (Nucleotide diversity)",
+  ThetaPerBP = "θ (Watterson's theta)",
+  TajimaD    = "Tajima's D"
+)
+
+# Paleta - ajuste as cores livremente
+cores_estat <- c(
+  PiPerBP    = "#CC79A7",
+  ThetaPerBP = "#E69F00",
+  TajimaD    = "#009E73"
+)
+```
+
+```{r funcoes}
+# Divide um vetor de strings delimitadas por "|" e devolve as colunas pedidas.
+# `fields` é um vetor nomeado de posições (1-based), ex.: c(Annotation = 2, Impact = 3).
+# Usado no ANN (SnpEff) e no LOF, tanto no VCF quanto no TSV do ideograma.
+split_pipe <- function(x, fields) {
+  f <- tstrsplit(x, "|", fixed = TRUE)
+  out <- lapply(fields, function(i) {
+    if (length(f) >= i) f[[i]] else rep(NA_character_, length(x))
+  })
+  setDT(out)
+  out
+}
+```
+
+# 2. VCF: leitura, estatística descritiva e DP
+
+O VCF é lido uma única vez. `fix_df` (colunas fixas e INFO) e `info_raw` alimentam
+as seções 2 e 5.
+
+```{r vcf_leitura}
+vcf <- read.vcfR(vcf_file, verbose = FALSE)
+
+n_variants <- nrow(vcf)
+n_samples  <- ncol(vcf@gt) - 1
+
+cat("Total de variantes:", n_variants, "\n")
+cat("Amostras:", n_samples, "\n")
+```
+
+## Campos INFO
+
+```{r vcf_campos}
+fix_df   <- as.data.frame(vcf@fix, stringsAsFactors = FALSE)
+info_raw <- extract_info_tidy(vcf, info_fields = c("AF", "AC", "AN", "DP"))
+
+info_vcf <- tibble(
+  QUAL = as.numeric(fix_df$QUAL),
+  AF   = as.numeric(sub(",.*", "", as.character(info_raw$AF))),  # 1º alelo ALT
+  AC   = as.numeric(sub(",.*", "", as.character(info_raw$AC))),  # 1º alelo ALT
+  AN   = as.numeric(info_raw$AN),
+  DP   = as.numeric(info_raw$DP)
+)
+```
+
+## DP por genótipo (FORMAT)
+
+```{r vcf_dp_gt}
+dp_gt <- extract.gt(vcf, element = "DP", as.numeric = TRUE)
+dim(dp_gt)
+```
+
+## Densidade de variantes por cromossomo
+
+```{r vcf_densidade_chr}
+# Contagem de variantes por cromossomo
+variants_chr <- fix_df %>%
+  count(CHROM, name = "Variants") %>%
+  rename(chr = CHROM)
+
+# Tabela de densidade de variantes
+chr_summary <- chr_lengths %>%
+  left_join(variants_chr, by = "chr") %>%
+  mutate(
+    Variants = replace_na(Variants, 0),
+    `Variants/Mb` = Variants / (len / 1e6)
+  ) %>%
+  transmute(
+    Chromosome = chr,
+    Length = len,
+    Variants,
+    `Variants/Mb` = round(`Variants/Mb`, 2)
+  )
+
+# Adicionar linha Total
+chr_summary <- bind_rows(
+  chr_summary,
+  chr_summary %>%
+    summarise(
+      Chromosome = "Total",
+      Length = sum(Length),
+      Variants = sum(Variants),
+      `Variants/Mb` = round(Variants / (Length / 1e6), 2)
+    )
+)
+
+# Exibir tabela
+print(chr_summary)
+```
+
+## Resumo estatístico (Campo INFO do VCF)
+
+```{r vcf_resumo}
+resumo <- info_vcf %>%
+  select(any_of(c("QUAL", "AF", "AC", "AN", "DP"))) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "Metrica",
+    values_to = "Valor"
+  ) %>%
+  group_by(Metrica) %>%
+  summarise(
+    N = sum(!is.na(Valor)),
+    Media = mean(Valor, na.rm = TRUE),
+    Mediana = median(Valor, na.rm = TRUE),
+    Minimo = min(Valor, na.rm = TRUE),
+    Maximo = max(Valor, na.rm = TRUE),
+    SD = sd(Valor, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(resumo)
+```
+
+```{r vcf_dp_medio}
+#O DP do campo INFO é a profundidade total por locus, somada entre as amostras (média de 223,6 leituras).
+#O DP do campo FORMAT é reportado por genótipo, e sua média entre amostras em cada locus (rowMeans) dá a
+#profundidade média por indivíduo (9,39x), medida independente do número de amostras e adequada para descrever a cobertura do conjunto de dados.
+
+# Média do FORMAT/DP entre amostras, por locus
+info_vcf$DP_medio_gt <- rowMeans(dp_gt, na.rm = TRUE)
+
+summary(info_vcf$DP_medio_gt)
+sd(info_vcf$DP_medio_gt, na.rm = TRUE)
+```
+
+```{r vcf_liberar_memoria}
+# O objeto vcfR e a matriz de DP são os maiores objetos do pipeline e não são mais
+# necessários: as seções seguintes usam apenas fix_df, n_variants e n_samples.
+rm(vcf, dp_gt, info_raw)
+invisible(gc())
+```
+
+# 3. Diversidade em janelas deslizantes (π, θ e D de Tajima)
+
+As métricas de missing (`.lmiss`) e de profundidade por sítio (`.ldepth.mean`) do
+TASSEL/vcftools foram excluídas deste bloco. A profundidade do conjunto de dados
+vem da seção 2.
+
+```{r div_leitura}
+div_win <- read.delim(div_file,
+  sep = "\t",
+  header = TRUE,
+  stringsAsFactors = FALSE) %>%
+  mutate(
+    across(
+      c(PiPerBP, ThetaPerBP, TajimaD),
+      ~ as.numeric(gsub(",", ".", .))))
+```
+
+## Estatística descritiva
+
+```{r div_descritiva}
+div_win %>%
+  select(PiPerBP, ThetaPerBP, TajimaD) %>%
+  summary()
+cat(" SD Pi:", sd(div_win$PiPerBP, na.rm = TRUE), "\n")
+cat(" SD Theta:", sd(div_win$ThetaPerBP, na.rm = TRUE), "\n")
+cat(" SD D:", sd(div_win$TajimaD, na.rm = TRUE), "\n")
+```
+
+## Distribuição geral
+
+```{r div_hist, fig.width=12, fig.height=4}
+p_div_hist <- div_win %>%
+  select(PiPerBP, ThetaPerBP, TajimaD) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "Estatistica",
+    values_to = "Valor"
+  ) %>%
+  ggplot(aes(x = Valor, fill = Estatistica)) +
+  geom_histogram(
+    bins = 50,
+    color = "black",
+    linewidth = 0.3
+  ) +
+  facet_wrap(
+    ~ Estatistica,
+    scales = "free",
+    labeller = labeller(Estatistica = labels_estat)
+  ) +
+  scale_fill_manual(values = cores_estat) +
+  labs(
+    x = NULL,
+    y = "Number of windows"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 11, color = "black"),
+    axis.text = element_text(color = "black", size = 10),
+    axis.title = element_text(color = "black", size = 12),
+    axis.line = element_line(color = "black", linewidth = 0.4),
+    axis.ticks = element_line(color = "black", linewidth = 0.4),
+    panel.spacing = unit(1.2, "lines"),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+p_div_hist
+
+ggsave(
+  "figura_diversidade_janelas.tiff",
+  plot = p_div_hist,
+  width = 180,
+  height = 70,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw"
+)
+```
+
+## Por cromossomo (boxplots)
+
+```{r div_boxplot_chr, fig.width=7, fig.height=7}
+div_long_chr <- div_win %>%
+  select(Chromosome, PiPerBP, ThetaPerBP, TajimaD) %>%
+  pivot_longer(
+    cols = c(PiPerBP, ThetaPerBP, TajimaD),
+    names_to = "Estatistica",
+    values_to = "Valor"
+  )
+
+lims <- div_long_chr %>%
+  group_by(Estatistica) %>%
+  summarise(
+    lo = quantile(Valor, 0.01, na.rm = TRUE),
+    hi = quantile(Valor, 0.99, na.rm = TRUE)
+  )
+
+p_div_box <- div_long_chr %>%
+  ggplot(aes(x = Chromosome, y = Valor, fill = Estatistica)) +
+  geom_boxplot(
+    outlier.size = 0.6,
+    outlier.alpha = 0.4,
+    color = "black",
+    linewidth = 0.3
+  ) +
+  facet_wrap(
+    ~ Estatistica,
+    scales = "free_y",
+    labeller = labeller(Estatistica = labels_estat),
+    ncol = 1
+  ) +
+  facetted_pos_scales(
+    y = list(
+      Estatistica == "PiPerBP"    ~ scale_y_continuous(limits = c(lims$lo[lims$Estatistica=="PiPerBP"],    lims$hi[lims$Estatistica=="PiPerBP"])),
+      Estatistica == "ThetaPerBP" ~ scale_y_continuous(limits = c(lims$lo[lims$Estatistica=="ThetaPerBP"], lims$hi[lims$Estatistica=="ThetaPerBP"])),
+      Estatistica == "TajimaD"    ~ scale_y_continuous(limits = c(lims$lo[lims$Estatistica=="TajimaD"],    lims$hi[lims$Estatistica=="TajimaD"]))
+    )
+  ) +
+  scale_fill_manual(values = cores_estat) +
+  labs(x = "Chromosome", y = NULL) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 11, color = "black"),
+    axis.text.x = element_text(color = "black", size = 9, angle = 45, hjust = 1),
+    axis.text.y = element_text(color = "black", size = 10),
+    axis.title = element_text(color = "black", size = 12),
+    axis.line = element_line(color = "black", linewidth = 0.4),
+    axis.ticks = element_line(color = "black", linewidth = 0.4),
+    panel.spacing = unit(1, "lines"),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+p_div_box
+
+# O arquivo recebeu o sufixo _boxplot porque, no script original, este ggsave e o da
+# figura por posição genômica (abaixo) gravavam no mesmo nome e o segundo sobrescrevia o primeiro.
+ggsave(
+  "figura_diversidade_por_cromossomo_boxplot.tiff",
+  plot = p_div_box,
+  width = 180,
+  height = 200,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw"
+)
+```
+
+## Por cromossomo (posição genômica)
+
+```{r div_genoma, fig.width=10, fig.height=7}
+# 1. Índice sequencial da janela dentro de cada cromossomo
+div_pos <- div_win %>%
+  select(Chromosome, PiPerBP, ThetaPerBP, TajimaD) %>%
+  mutate(Chromosome = factor(Chromosome, levels = unique(Chromosome))) %>%
+  group_by(Chromosome) %>%
+  mutate(Pos = row_number()) %>%
+  ungroup()
+
+# 2. Offset cumulativo para eixo x genômico contínuo
+chr_offsets <- div_pos %>%
+  group_by(Chromosome) %>%
+  summarise(max_pos = max(Pos), .groups = "drop") %>%
+  mutate(offset = lag(cumsum(as.numeric(max_pos)), default = 0))
+
+div_pos <- div_pos %>%
+  left_join(chr_offsets %>% select(Chromosome, offset), by = "Chromosome") %>%
+  mutate(GenomePos = Pos + offset)
+
+# 3. Posição central de cada cromossomo, para os rótulos do eixo x
+eixo_chr <- div_pos %>%
+  group_by(Chromosome) %>%
+  summarise(center = mean(GenomePos), .groups = "drop")
+
+# 4. Formato longo
+div_long_gen <- div_pos %>%
+  select(Chromosome, GenomePos, PiPerBP, ThetaPerBP, TajimaD) %>%
+  pivot_longer(
+    cols = c(PiPerBP, ThetaPerBP, TajimaD),
+    names_to = "Estatistica",
+    values_to = "Valor"
+  )
+
+div_long_gen <- div_long_gen %>%
+  mutate(Estatistica = factor(Estatistica, levels = c("PiPerBP", "ThetaPerBP", "TajimaD")))
+
+# 5. Máximo, mínimo e mediana globais por métrica (linhas de referência)
+stats_linhas <- div_long_gen %>%
+  group_by(Estatistica) %>%
+  summarise(
+    Maximo  = max(Valor, na.rm = TRUE),
+    Minimo  = min(Valor, na.rm = TRUE),
+    Mediana = median(Valor, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+div_long_gen <- div_long_gen %>%
+  left_join(stats_linhas, by = "Estatistica")
+
+# 6. Paleta com uma cor por cromossomo
+n_chr <- nlevels(div_pos$Chromosome)
+paleta_chr <- hcl.colors(n_chr, palette = "Dark 3")
+names(paleta_chr) <- levels(div_pos$Chromosome)
+
+p_div_genoma <- div_long_gen %>%
+  ggplot(aes(x = GenomePos, y = Valor, color = Chromosome)) +
+  geom_point(size = 0.5, alpha = 0.6, show.legend = FALSE) +
+  geom_hline(aes(yintercept = Maximo), color = "darkblue", linewidth = 0.5) +
+  geom_hline(aes(yintercept = Minimo), color = "red", linewidth = 0.5) +
+  geom_hline(aes(yintercept = Mediana), color = "black", linewidth = 0.5, linetype = "dashed") +
+  facet_wrap(
+    ~ Estatistica,
+    scales = "free_y",
+    labeller = labeller(Estatistica = labels_estat),
+    ncol = 1
+  ) +
+  scale_color_manual(values = paleta_chr) +
+  scale_x_continuous(
+    breaks = eixo_chr$center,
+    labels = eixo_chr$Chromosome,
+    expand = c(0.01, 0.01)
+  ) +
+  labs(x = "Chromosome", y = NULL) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 11, color = "black"),
+    axis.text.x = element_text(color = "black", size = 9),
+    axis.ticks.x = element_blank(),
+    axis.text.y = element_text(color = "black", size = 10),
+    axis.title = element_text(color = "black", size = 12),
+    axis.line = element_line(color = "black", linewidth = 0.4),
+    panel.spacing = unit(1, "lines"),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+p_div_genoma
+
+ggsave(
+  "figura_diversidade_por_cromossomo.tiff",
+  plot = p_div_genoma,
+  width = 240,
+  height = 200,
+  units = "mm",
+  dpi = 300,
+  compression = "lzw"
+)
+```
+
+# 4. Profundidade por indivíduo
+
+```{r depth_individuo, fig.width=7, fig.height=5}
+# ---- 1. Ler dados ----
+depth <- read_tsv(
+  idepth_file,
+  show_col_types = FALSE
+)
+
+# ---- 2. Estatísticas descritivas (calculadas a partir dos dados) ----
+q1  <- quantile(depth$MEAN_DEPTH, 0.25, na.rm = TRUE)
+med <- median(depth$MEAN_DEPTH, na.rm = TRUE)
+avg <- mean(depth$MEAN_DEPTH, na.rm = TRUE)
+q3  <- quantile(depth$MEAN_DEPTH, 0.75, na.rm = TRUE)
+n_ind <- nrow(depth)
+
+# ---- 3. Ordenar indivíduos pela profundidade ----
+depth <- depth %>%
+  arrange(MEAN_DEPTH) %>%
+  mutate(INDV = factor(INDV, levels = INDV))
+
+x_max <- ceiling(max(depth$MEAN_DEPTH, na.rm = TRUE)) + 1
+
+# ---- 4. Gráfico ----
+p_depth <- ggplot(depth, aes(x = MEAN_DEPTH, y = INDV)) +
+  # Região entre Q1 e Q3
+  annotate(
+    "rect",
+    xmin = q1, xmax = q3, ymin = -Inf, ymax = Inf,
+    fill = "grey85", alpha = 0.5
+  ) +
+  # Linhas individuais
+  geom_segment(
+    aes(x = 0, xend = MEAN_DEPTH, yend = INDV),
+    linewidth = 0.45, color = "grey65"
+  ) +
+  # Mediana e média (com legenda própria em vez de linhas "mudas")
+  geom_vline(
+    aes(xintercept = med, linetype = "Median"),
+    linewidth = 0.6, color = "grey20"
+  ) +
+  geom_vline(
+    aes(xintercept = avg, linetype = "Mean"),
+    linewidth = 0.6, color = "grey20"
+  ) +
+  scale_linetype_manual(
+    name = NULL,
+    values = c("Median" = "dashed", "Mean" = "dotted")
+  ) +
+  # Pontos
+  geom_point(size = 3, color = "#D55E00") +
+  labs(
+    x = "Genotyped loci mean sequencing depth (×)",
+    y = NULL,
+    caption = sprintf(
+      "n = %d individuals; grey band = IQR",
+      n_ind, q1, q3
+    )
+  ) +
+  scale_x_continuous(
+    limits = c(0, x_max),
+    breaks = seq(0, x_max, 2),
+    expand = expansion(mult = c(0, 0.05))
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    axis.text.y  = element_text(size = 8),
+    axis.text.x  = element_text(size = 9),
+    axis.title.x = element_text(size = 11, margin = margin(t = 6)),
+    axis.line.y  = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.grid.major.x = element_line(linewidth = 0.3, color = "grey90"),
+    panel.grid.minor    = element_blank(),
+    legend.position   = "bottom",
+    legend.margin     = margin(t = -8),
+    legend.text       = element_text(size = 9),
+    plot.caption      = element_text(size = 8, color = "grey30", hjust = 0),
+    plot.margin       = margin(t = 8, r = 10, b = 5, l = 5)
+  )
+
+# Mostrar
+print(p_depth)
+
+# ---- 5. Salvar ----
+ggsave(
+  "profundidade_media_por_individuo.png",
+  plot = p_depth, width = 7.5, height = 6, units = "in", dpi = 600, bg = "white"
+)
+
+ggsave(
+  "profundidade_media_por_individuo.pdf",
+  plot = p_depth, width = 7.5, height = 6, units = "in"
+)
+
+# TIFF costuma ser exigido por alguns periódicos (ex.: 300 dpi, compressão LZW)
+# ggsave(
+#   "profundidade_media_por_individuo.tiff",
+#   plot = p_depth, width = 7.5, height = 6, units = "in", dpi = 300,
+#   compression = "lzw", bg = "white"
+# )
+```
+
+# 5. Anotação funcional (SnpEff)
+
+## 5.1 Extração das anotações
+
+```{r ann_extracao}
+# ANN (SnpEff): Allele|Annotation|Impact|Gene_Name|Gene_ID|...
+# Usa-se apenas a primeira anotação de cada variante (a mais severa).
+ann_str  <- str_match(fix_df$INFO, "ANN=([^;]+)")[, 2]
+ann_cols <- split_pipe(sub(",.*", "", ann_str),
+                       c(Annotation = 2, Impact = 3, GeneName = 4, GeneID = 5))
+
+variants <- tibble(
+  CHROM      = fix_df$CHROM,
+  POS        = fix_df$POS,
+  REF        = fix_df$REF,
+  ALT        = fix_df$ALT,
+  Annotation = ann_cols$Annotation,
+  Impact     = ann_cols$Impact,
+  GeneName   = ann_cols$GeneName,
+  GeneID     = ann_cols$GeneID
+)
+rm(ann_str, ann_cols)
+
+cat("Variantes anotadas:", sum(!is.na(variants$Impact)), "\n")
+```
+
+## 5.2 Resumo de impacto
+
+```{r ann_impacto}
+impact_summary <- variants %>%
+  filter(!is.na(Impact)) %>%
+  count(Impact) %>%
+  arrange(desc(n)) %>%
+  mutate(Percent = round(n/sum(n)*100, 1))
+
+knitr::kable(impact_summary, col.names = c("Impact", "Total", "%"))
+```
+
+```{r ann_codificantes}
+coding_summary <- variants %>%
+  filter(Annotation %in% c(
+    "missense_variant",
+    "stop_gained",
+    "synonymous_variant"
+  )) %>%
+  mutate(
+    Variant_Type = case_when(
+      Annotation == "missense_variant" ~ "MISSENSE",
+      Annotation == "stop_gained" ~ "NONSENSE",
+      Annotation == "synonymous_variant" ~ "SILENT"
+    )
+  ) %>%
+  count(Variant_Type, name = "Total") %>%
+  complete(
+    Variant_Type = c("MISSENSE", "NONSENSE", "SILENT"),
+    fill = list(Total = 0)
+  ) %>%
+  mutate(
+    Percentage = round(Total / sum(Total) * 100, 2)
+  )
+
+knitr::kable(
+  coding_summary,
+  col.names = c("Variant class", "Total", "Percentage (%)"),
+  caption = "Distribution of coding variant consequences"
+)
+```
+
+```{r ann_impacto_plot}
+impact_summary %>%
+  mutate(Impact = factor(Impact, levels = impact_levels)) %>%
+  ggplot(aes(x = Impact, y = n, fill = Impact)) +
+  geom_col() +
+  scale_fill_manual(values = impact_cols, na.value = "grey50") +
+  labs(title = "Distribuição de Variantes por Impacto", y = "Total") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+## 5.3 Tipos de anotação
+
+```{r ann_tipos}
+annotation_summary <- variants %>%
+  filter(!is.na(Annotation)) %>%
+  count(Annotation, Impact) %>%
+  mutate(Percentage = (n / sum(n)) * 100) %>%
+  arrange(desc(n)) %>%
+  slice_head(n = 15) %>%
+  mutate(Percentage = round(Percentage, 2)) %>%
+  bind_rows(
+    tibble(
+      Annotation = "...",
+      Impact = "...",
+      n = NA_integer_,
+      Percentage = NA_real_
+    )
+  )
+
+knitr::kable(
+  annotation_summary,
+  col.names = c("Variant consequence", "Impact", "Total", "Percentage (%)")
+)
+```
+
+```{r ann_tipos_plot, fig.height=6}
+annotation_summary %>%
+  mutate(Impact = factor(Impact, levels = impact_levels)) %>%
+  ggplot(aes(x = reorder(Annotation, n), y = n, fill = Impact)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = impact_cols, na.value = "grey50") +
+  labs(title = "Top 15 Tipos de Variantes", x = "Tipo", y = "Total") +
+  theme_minimal()
+```
+
+## 5.4 Análise por gene
+
+```{r ann_genes}
+genes_summary <- variants %>%
+  filter(!is.na(GeneName), GeneName != "") %>%
+  group_by(GeneName, GeneID) %>%
+  summarise(
+    Total = n(),
+    HIGH = sum(Impact == "HIGH", na.rm = TRUE),
+    MODERATE = sum(Impact == "MODERATE", na.rm = TRUE),
+    LOW = sum(Impact == "LOW", na.rm = TRUE),
+    MODIFIER = sum(Impact == "MODIFIER", na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Total))
+
+cat("Genes afetados:", nrow(genes_summary), "\n")
+cat("Genes com HIGH impact:", sum(genes_summary$HIGH > 0), "\n")
+```
+
+### Top 20 genes
+
+```{r ann_genes_top20}
+genes_summary %>%
+  head(20) %>%
+  knitr::kable()
+```
+
+```{r ann_genes_top20_plot, fig.height=6}
+genes_summary %>%
+  head(20) %>%
+  pivot_longer(cols = c(HIGH, MODERATE, LOW), names_to = "Impact", values_to = "Count") %>%
+  filter(Count > 0) %>%
+  mutate(Impact = factor(Impact, levels = c("HIGH", "MODERATE", "LOW"))) %>%
+  ggplot(aes(x = reorder(GeneName, Count, sum), y = Count, fill = Impact)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = impact_cols[c("HIGH", "MODERATE", "LOW")]) +
+  labs(title = "Top 20 Genes Mais Afetados", x = "Gene", y = "Variantes") +
+  theme_minimal()
+```
+
+## 5.5 Variantes HIGH impact
+
+```{r ann_high}
+high_variants <- variants %>%
+  filter(Impact == "HIGH") %>%
+  select(CHROM, POS, REF, ALT, Annotation, GeneName, GeneID)
+
+cat("Total HIGH impact:", nrow(high_variants), "\n")
+```
+
+```{r ann_high_tabela}
+if (nrow(high_variants) > 0) {
+  datatable(high_variants,
+            caption = "Variantes de Alto Impacto (HIGH)",
+            options = list(pageLength = 10, scrollX = TRUE),
+            rownames = FALSE)
+}
+```
+
+## 5.6 Genes de alto impacto funcional
+
+```{r ann_genes_funcionais}
+functional_genes <- genes_summary %>%
+  filter(HIGH > 0 | MODERATE >= 5) %>%
+  arrange(desc(HIGH), desc(MODERATE))
+
+cat("Genes com alto impacto funcional:", nrow(functional_genes), "\n")
+cat("  - Com variantes HIGH:", sum(functional_genes$HIGH > 0), "\n")
+cat("  - Com ≥5 MODERATE:", sum(functional_genes$MODERATE >= 5), "\n")
+cat("\nCandidatos para estudos de diversidade e adaptação\n")
+```
+
+```{r ann_genes_funcionais_tabela}
+datatable(functional_genes,
+          caption = "Genes com Alto Impacto Funcional",
+          options = list(pageLength = 10, scrollX = TRUE),
+          rownames = FALSE,
+          filter = 'top')
+```
+
+## 5.7 Variantes Loss of Function (LOF)
+
+```{r ann_lof}
+# LOF (SnpEff): LOF=(Gene_Name|Gene_ID|Number_of_transcripts|Percent_affected)
+lof_str  <- str_match(fix_df$INFO, "LOF=\\(([^)]+)\\)")[, 2]
+lof_idx  <- which(!is.na(lof_str))
+lof_cols <- split_pipe(lof_str[lof_idx],
+                       c(LOF_GeneName = 1, LOF_GeneID = 2,
+                         LOF_Transcripts = 3, LOF_Percent = 4))
+
+lof_variants <- tibble(
+  CHROM           = fix_df$CHROM[lof_idx],
+  POS             = fix_df$POS[lof_idx],
+  REF             = fix_df$REF[lof_idx],
+  ALT             = fix_df$ALT[lof_idx],
+  LOF_GeneName    = lof_cols$LOF_GeneName,
+  LOF_GeneID      = lof_cols$LOF_GeneID,
+  LOF_Transcripts = lof_cols$LOF_Transcripts,
+  LOF_Percent     = lof_cols$LOF_Percent
+)
+
+# fix_df (com o campo INFO completo) não é mais necessário a partir daqui
+rm(fix_df, lof_str, lof_idx, lof_cols)
+
+cat("Variantes LOF identificadas:", nrow(lof_variants), "\n")
+cat("Genes afetados por LOF:", n_distinct(lof_variants$LOF_GeneName), "\n")
+```
+
+```{r ann_lof_tabela}
+if (nrow(lof_variants) > 0) {
+  datatable(lof_variants,
+            caption = "Variantes Loss of Function (LOF) - Perda de Função Gênica",
+            options = list(pageLength = 10, scrollX = TRUE),
+            rownames = FALSE)
+}
+```
+
+```{r ann_lof_genes}
+if (nrow(lof_variants) > 0) {
+  lof_genes <- lof_variants %>%
+    count(LOF_GeneName, name = "LOF_Count") %>%
+    arrange(desc(LOF_Count)) %>%
+    head(15)
+
+  knitr::kable(lof_genes,
+               col.names = c("Gene", "Variantes LOF"),
+               caption = "Top 15 Genes com Variantes LOF")
+}
+```
+
+## 5.8 Variantes missense
+
+```{r ann_missense}
+missense_variants <- variants %>%
+  filter(str_detect(Annotation, "missense")) %>%
+  select(CHROM, POS, GeneName, GeneID, Impact)
+
+cat("Variantes missense:", nrow(missense_variants), "\n")
+```
+
+```{r ann_missense_genes}
+if (nrow(missense_variants) > 0) {
+  missense_genes <- missense_variants %>%
+    count(GeneName, Impact) %>%
+    arrange(desc(n)) %>%
+    head(20)
+
+  knitr::kable(missense_genes, caption = "Top 20 Genes com Missense")
+}
+```
+
+## 5.9 Distribuição cromossômica
+
+```{r ann_chr}
+chrom_summary <- variants %>%
+  filter(!is.na(Impact)) %>%
+  count(CHROM, Impact) %>%
+  group_by(CHROM) %>%
+  mutate(Total = sum(n)) %>%
+  arrange(desc(Total))
+
+# Top 10 cromossomos
+top_chroms <- head(unique(chrom_summary$CHROM), 10)
+```
+
+```{r ann_chr_plot, fig.height=6}
+chrom_summary %>%
+  filter(CHROM %in% top_chroms) %>%
+  mutate(Impact = factor(Impact, levels = impact_levels)) %>%
+  ggplot(aes(x = reorder(CHROM, -Total), y = n, fill = Impact)) +
+  geom_col() +
+  scale_fill_manual(values = impact_cols, na.value = "grey50") +
+  labs(title = "Distribuição de Variantes nos Top 10 Cromossomos",
+       x = "Cromossomo", y = "Variantes") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## 5.10 Exportar resultados da anotação
+
+```{r ann_exportar}
+dir.create("results", showWarnings = FALSE)
+
+write_csv(variants, "results/variantes_anotadas.csv")
+write_csv(genes_summary, "results/genes_resumo.csv")
+write_csv(high_variants, "results/variantes_high_impact.csv")
+###write_csv(functional_genes, "results/genes_alto_impacto_funcional.csv")
+
+if (nrow(lof_variants) > 0) {
+  write_csv(lof_variants, "results/variantes_lof.csv")
+}
+
+cat("✓ Arquivos exportados:\n")
+cat("  - results/variantes_anotadas.csv\n")
+cat("  - results/genes_resumo.csv\n")
+cat("  - results/variantes_high_impact.csv\n")
+####cat("  - results/genes_alto_impacto_funcional.csv\n")
+if (nrow(lof_variants) > 0) {
+  cat("  - results/variantes_lof.csv\n")
+}
+```
+
+## 5.11 Resumo final
+
+```{r ann_resumo_final}
+data.frame(
+  Métrica = c("Total Variantes", "Variantes Anotadas", "Genes Afetados",
+              "HIGH Impact", "MODERATE Impact", "Variantes LOF"),
+  Valor = c(n_variants, sum(!is.na(variants$Impact)), nrow(genes_summary),
+            nrow(high_variants), sum(variants$Impact == "MODERATE", na.rm = TRUE),
+            nrow(lof_variants))
+) %>%
+  knitr::kable()
+```
+
+# 6. Ideograma circular
+
+Esta seção parte do TSV gerado por `01_extract_snpeff_ann.sh` (colunas `CHROM`,
+`POS`, `ANN`) e produz um ideograma circular com um anel externo de cromossomos
+seguido de um anel de cobertura e quatro anéis de densidade: total de SNPs, SNPs em
+CDS, SNPs missense e SNPs de alto impacto.
+
+O TSV é lido com `data.table` e não com `vcfR` porque, para cerca de 7 milhões de
+variantes, o objeto S4 do `vcfR` pode ultrapassar a RAM disponível. O campo ANN é
+interpretado com a mesma função (`split_pipe`) usada na seção 5.
+
+## 6.1 Leitura do TSV bruto (CHROM, POS, ANN)
+
+```{r circos_leitura}
+dt_ann <- fread(
+  ann_file,
+  header    = FALSE,
+  sep       = "\t",
+  quote     = "",
+  col.names = c("CHROM", "POS", "ANN"),
+  na.strings = c("", ".")
+)
+
+# Alguns registros podem não ter anotação (ANN ausente); mantidos como
+# "sem anotação" nas contagens de total, mas excluídos das categorias
+# derivadas do campo ANN.
+dt_ann[, has_ann := !is.na(ANN)]
+```
+
+## 6.2 Parsing do campo ANN
+
+Por convenção do SnpEff, a primeira anotação da lista é a de maior
+impacto/relevância, por isso é a única usada. Campos relevantes (índice 1-based)
+
+- `2` Annotation (ex.: `missense_variant`, `synonymous_variant`)
+- `3` Annotation_Impact (`HIGH` / `MODERATE` / `LOW` / `MODIFIER`)
+- `13` CDS_pos/CDS_length (não vazio implica variante dentro de um CDS)
+
+```{r circos_parsing_ann}
+dt_ann[has_ann == TRUE, ANN1 := sub(",.*", "", ANN)]
+
+ann_f <- split_pipe(dt_ann$ANN1, c(Annotation = 2, Impact = 3, CDS_pos = 13))
+
+dt_ann[, Annotation := ann_f$Annotation]
+dt_ann[, Impact     := ann_f$Impact]
+dt_ann[, CDS_pos    := ann_f$CDS_pos]
+rm(ann_f)
+
+dt_ann[, is_cds      := has_ann & !is.na(CDS_pos) & CDS_pos != ""]
+dt_ann[, is_missense := has_ann & Annotation == "missense_variant"]
+dt_ann[, is_high     := has_ann & Impact == "HIGH"]
+
+# Libera memória das colunas intermediárias antes do binning
+dt_ann[, c("ANN", "ANN1") := NULL]
+```
+
+## 6.3 Binning em janelas genômicas por cromossomo
+
+```{r circos_binning}
+dt_ann[, bin_start := (POS %/% window_size) * window_size]
+
+density_dt <- dt_ann[, .(
+  total    = .N,
+  cds      = sum(is_cds),
+  missense = sum(is_missense),
+  high     = sum(is_high)
+), by = .(CHROM, bin_start)]
+
+density_dt[, bin_end := bin_start + window_size]
+setorder(density_dt, CHROM, bin_start)
+
+rm(dt_ann); gc()
+```
+
+## 6.4 Comprimentos dos cromossomos e tabelas "bed-like"
+
+`chr_lengths` (seção 1) não é alterado. Quando `chroms_keep` é informado, a
+restrição vale apenas para o ideograma.
+
+```{r circos_cromossomos}
+chr_lengths_circ <- chr_lengths
+if (!is.null(chroms_keep)) {
+  chr_lengths_circ <- chr_lengths[chr_lengths$chr %in% chroms_keep, ]
+  density_dt       <- density_dt[CHROM %in% chroms_keep]
+}
+
+chr_df <- data.frame(chr = chr_lengths_circ$chr, start = 0, end = chr_lengths_circ$len)
+
+make_bed <- function(value_col) {
+  data.frame(
+    chr   = density_dt$CHROM,
+    start = density_dt$bin_start,
+    end   = density_dt$bin_end,
+    value = density_dt[[value_col]]
+  )
+}
+
+bed_total    <- make_bed("total")
+bed_cds      <- make_bed("cds")
+bed_missense <- make_bed("missense")
+bed_high     <- make_bed("high")
+```
+
+## 6.5 Profundidade de cobertura (mosdepth)
+
+Leitura dos arquivos `*.regions.bed` do mosdepth, um por amostra, com a
+profundidade média entre amostras em janelas largas. O anel é desenhado
+como um mapa de calor (retângulos coloridos por `colorRamp2`), para se
+distinguir das barras dos anéis de SNPs.
+
+```{r circos_cobertura}
+cov_files <- list.files(cov_dir, pattern = "\\.regions\\.bed(\\.gz)?$", full.names = TRUE)
+print(basename(cov_files))                  # confira visualmente
+stopifnot(length(cov_files) > 0)
+
+# lê uma amostra e calcula a profundidade média por janela grande
+media_por_janela <- function(f) {
+  x <- fread(f, header = FALSE, col.names = c("chr", "start", "end", "depth"))
+  x <- x[chr %in% chr_df$chr]               # descarta scaffolds fora dos 8 cromossomos
+  x[, bin_start := (start %/% cov_window) * cov_window]
+  x[, .(depth = mean(depth)), by = .(chr, bin_start)]
+}
+
+# média entre amostras, por janela
+cov_dt <- rbindlist(lapply(cov_files, media_por_janela))
+cov_dt <- cov_dt[, .(value = mean(depth)), by = .(chr, bin_start)]
+setorder(cov_dt, chr, bin_start)
+
+bed_cov <- data.frame(
+  chr   = cov_dt$chr,
+  start = cov_dt$bin_start,
+  end   = cov_dt$bin_start + cov_window,
+  value = cov_dt$value
+)
+
+# a última janela de cada cromossomo não pode passar do comprimento dele
+bed_cov$end <- pmin(bed_cov$end, chr_lengths_circ$len[match(bed_cov$chr, chr_lengths_circ$chr)])
+
+# escala de cor de 0 ao percentil 99, para picos isolados não achatarem a escala
+cov_max       <- quantile(bed_cov$value, 0.99, na.rm = TRUE)
+bed_cov$value <- pmin(bed_cov$value, cov_max)
+cov_col_fun   <- colorRamp2(c(0, cov_max), c("#F4ECF7", "#6A3D9A"))
+
+# função do anel de cobertura (retângulos coloridos pelo valor)
+add_coverage_track <- function(bed) {
+  circos.genomicTrackPlotRegion(
+    bed,
+    ylim = c(0, 1),
+    bg.border = NA,
+    panel.fun = function(region, value, ...) {
+      circos.genomicRect(region, value, ytop = 1, ybottom = 0,
+                         col = cov_col_fun(value[[1]]), border = NA)})}
+```
+
+## 6.6 Plot circular
+
+```{r circos_plot, fig.width=9, fig.height=8}
+make_col_fun <- function(bed, color) {
+  vmax <- quantile(bed$value, 0.99, na.rm = TRUE)
+  if (!is.finite(vmax) || vmax <= 0) vmax <- max(bed$value, na.rm = TRUE)
+  if (!is.finite(vmax) || vmax <= 0) vmax <- 1
+  colorRamp2(c(0, vmax), c(colorRampPalette(c("white", color))(10)[2], color))
+}
+
+add_density_track <- function(bed, color) {
+  col_fun <- make_col_fun(bed, color)
+  bed$end <- pmin(bed$end, chr_lengths_circ$len[match(bed$chr, chr_lengths_circ$chr)])
+  circos.genomicTrackPlotRegion(
+    bed,
+    ylim = c(0, 1),
+    bg.border = NA,
+    panel.fun = function(region, value, ...) {
+      circos.genomicRect(region, value, ytop = 1, ybottom = 0,
+                         col = col_fun(value[[1]]), border = NA)})}
+
+track_labels <- c("Total SNPs", "CDS SNPs", "Missense", "High-impact")
+track_colors <- c("#0072B2", "#E69F00", "#009E73", "#D55E00")
+
+# Legendas em gradiente, empilhadas na faixa livre à direita
+add_all_legends <- function(frac_circulo = 0.85) {
+  beds <- list(bed_total, bed_cds, bed_missense, bed_high)
+  lgds <- mapply(function(bed, color, lab) {
+    Legend(col_fun = make_col_fun(bed, color), title = lab,
+           legend_height = grid::unit(1.2, "cm"))
+  }, beds, track_colors, track_labels, SIMPLIFY = FALSE)
+  lgds <- c(lgds, list(Legend(col_fun = cov_col_fun, title = "Mean Depth (X)",
+                              legend_height = grid::unit(1.2, "cm"))))
+  ComplexHeatmap::draw(packLegend(list = lgds),
+                       x = grid::unit(frac_circulo, "npc") + grid::unit(1, "mm"),
+                       y = grid::unit(0.5, "npc"), just = "left")
+}
+
+# Círculo na parte esquerda (85% da largura); o restante fica para as legendas
+plot_circos <- function(frac_circulo = 0.85) {
+  par(fig = c(0, frac_circulo, 0, 1), mar = c(1, 1, 3, 1))
+  circos.clear()
+  circos.par(gap.degree = 1.5, start.degree = 90, track.height = 0.12)
+
+  circos.genomicInitialize(chr_df, plotType = c("axis", "labels"), track.height = 0.05)
+
+  add_coverage_track(bed_cov)
+  add_density_track(bed_total,    track_colors[1])
+  add_density_track(bed_cds,      track_colors[2])
+  add_density_track(bed_missense, track_colors[3])
+  add_density_track(bed_high,     track_colors[4])
+
+  circos.clear()
+  add_all_legends(frac_circulo)
+  par(fig = c(0, 1, 0, 1))
+}
+
+plot_circos()
+```
+
+## 6.7 Exportar a tabela agregada e salvar a figura
+
+A tabela agregada permite inspecionar os valores ou refazer o plot sem reprocessar
+o TSV inteiro.
+
+```{r circos_exportar}
+fwrite(density_dt, "snp_density_by_window.tsv", sep = "\t")
+
+cairo_pdf("figura_SNPs_circos.pdf", width = 9, height = 8)
+plot_circos()
+dev.off()
+
+png("figura_snps_circos.png", width = 9, height = 8, units = "in", res = 600)
+plot_circos()
+dev.off()
+```
+## Teste - Precisa de alguns ajustes
+
+```{r}
+# ---- Parâmetros do teste ----
+usar_todas <- TRUE                  # TRUE = todas as anotações de cada variante (como o SnpEff)
+                                    # FALSE = só a primeira anotação (lógica do resto do pipeline)
+classes_aa <- "missense_variant"    # classes incluídas; NULL = todas com substituição simples
+
+# Código de 3 letras (HGVS.p) para 1 letra
+aa3to1 <- c(Ala = "A", Arg = "R", Asn = "N", Asp = "D", Cys = "C", Gln = "Q",
+            Glu = "E", Gly = "G", His = "H", Ile = "I", Leu = "L", Lys = "K",
+            Met = "M", Phe = "F", Pro = "P", Ser = "S", Thr = "T", Trp = "W",
+            Tyr = "Y", Val = "V", Ter = "*", `*` = "*")
+aa_levels <- c("A","R","N","D","C","Q","E","G","H","I","L","K","M","F","P","S","T","W","Y","V","*")
+
+# ---- 0. Garante o fix_df (removido no chunk ann_lof) ----
+# Se ele não estiver na sessão, lê só as colunas fixas e o INFO direto do VCF, sem vcfR.
+if (!exists("fix_df")) {
+  fix_df <- fread(vcf_file, skip = "#CHROM", select = c(1, 2, 4, 5, 8),
+                  col.names = c("CHROM", "POS", "REF", "ALT", "INFO"))
+}
+
+# ---- 1. Uma linha por anotação (efeito) ----
+ann_str  <- str_match(fix_df$INFO, "ANN=([^;]+)")[, 2]
+ann_list <- strsplit(ann_str, ",", fixed = TRUE)
+if (!usar_todas) ann_list <- lapply(ann_list, function(x) x[1])
+
+ann_all <- data.table(
+  var_idx = rep(seq_along(ann_list), lengths(ann_list)),
+  ann     = unlist(ann_list, use.names = FALSE)
+)
+rm(ann_str, ann_list)
+
+# mantém só efeitos que têm HGVS.p (campo 11 do ANN começa com "p.")
+ann_all <- ann_all[!is.na(ann) & grepl("|p.", ann, fixed = TRUE)]
+
+# ---- 2. Campos 2 (Annotation) e 11 (HGVS.p) ----
+ann_cols <- split_pipe(ann_all$ann, c(Annotation = 2, HGVS_p = 11))
+ann_all[, Annotation := ann_cols$Annotation]
+ann_all[, HGVS_p     := ann_cols$HGVS_p]
+ann_all[, ann := NULL]
+rm(ann_cols)
+
+# ---- 3. Substituições simples: p.Ala123Thr, p.Gln10* ----
+m <- str_match(ann_all$HGVS_p, "^p\\.([A-Z][a-z]{2})\\d+([A-Z][a-z]{2}|\\*)$")
+ann_all[, aa_ref := unname(aa3to1[m[, 2]])]
+ann_all[, aa_alt := unname(aa3to1[m[, 3]])]
+
+cat("Efeitos com HGVS.p:", nrow(ann_all), "\n")
+cat("Com substituição simples:", sum(!is.na(ann_all$aa_ref) & !is.na(ann_all$aa_alt)), "\n")
+print(ann_all[!is.na(aa_ref), .N, by = Annotation][order(-N)])
+
+aa_sub <- ann_all[!is.na(aa_ref) & !is.na(aa_alt)]
+if (!is.null(classes_aa)) aa_sub <- aa_sub[Annotation %in% classes_aa]
+
+# ---- 4. Tabela Ref x Alt ----
+aa_mat <- table(Ref = factor(aa_sub$aa_ref, levels = aa_levels),
+                Alt = factor(aa_sub$aa_alt, levels = aa_levels))
+print(aa_mat)
+
+cat("Total de mudanças contadas:", sum(aa_mat), "\n")
+cat("Variantes distintas:", uniqueN(aa_sub$var_idx), "\n")
+
+# ---- 5. Matriz em heatmap ----
+as.data.frame(aa_mat) %>%
+  ggplot(aes(x = Alt, y = forcats::fct_rev(Ref), fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(data = ~ filter(.x, Freq > 0), aes(label = Freq), size = 2.8) +
+  scale_fill_gradient(low = "white", high = "#D55E00", name = "Count") +
+  labs(title = "Amino acid changes", x = "Alternative amino acid", y = "Reference amino acid") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid = element_blank())
+```
+
