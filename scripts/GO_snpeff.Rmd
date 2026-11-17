@@ -1,0 +1,130 @@
+---
+title: "GO_analysis"
+output: html_notebook
+---
+
+> Artur Silva 08/11/26
+
+```{r}
+library(tidyverse)
+```
+
+## 1. Genes com pelo menos uma variante HIGH (ANN[0] -- o mais impactante, excluindo isoformas)
+
+```{r}
+var <- read_tsv("variantes_id_impact_effect.tsv", skip = 1, show_col_types = FALSE,
+                col_names = c("chrom","pos","id","ref","alt","gene_name","gene",
+                              "transcript","effect","impact")) %>%
+  filter(
+    str_detect(chrom, "^Dal_0[1-8]$"),
+    gene != ".",
+    !str_detect(gene, "unplaced"),
+    !str_detect(transcript, "unplaced")
+  )
+```
+
+```{r}
+genes_high <- var %>% 
+  filter(impact == "HIGH") %>% 
+  distinct(gene)
+```
+
+```{r}
+# Resumo quantitativo dos HIGH
+tibble(variantes_total = nrow(var),
+       variantes_HIGH  = sum(var$impact == "HIGH"),
+       genes_HIGH      = nrow(genes_high))
+
+var %>% 
+  filter(impact == "HIGH") %>% 
+  count(effect, sort = TRUE)
+```
+
+## 2. Gene -> GO a partir do arquivo do eggNOG-mapper
+
+```{r}
+ann <- read_tsv("annotated_gene_ontology_terms.tsv", show_col_types = FALSE) %>%
+  filter(!str_detect(query_sequence, "unplaced"))
+
+names(ann)   # esperado: "query_sequence" "go_id" "go_term" "category"
+
+# Quantas linhas são termos obsoletos ou termos raiz
+ann %>% 
+  summarise(linhas    = n(),
+            obsoletos = sum(str_detect(go_term, "^obsolete")),
+            raizes    = sum(go_term == category))
+```
+
+```{r}
+# Transcrito -> gene, montado a partir do próprio SnpEff
+tx2gene <- var %>%
+  filter(transcript != ".") %>%
+  distinct(query = transcript, gene)
+
+gene2go <- ann %>%
+  filter(
+    !str_detect(go_term, "^obsolete"),
+    !go_id %in% c("GO:0008150", "GO:0005575", "GO:0003674")
+  ) %>%
+  inner_join(tx2gene, by = c("query_sequence" = "query")) %>%
+  distinct(gene, go_id, go_term, category)
+```
+
+#### O objeto tx2gene é montado a partir da tabela do SnpEff (var), usando as colunas transcript e gene. Depois esse objeto é unido ao arquivo de anotação
+#### Ou seja, o ID do transcrito que o SnpEff reporta é comparado com o query_sequence do EnTAP. Essa é a ponte que leva do GO (anotado por transcrito) ao gene (a unidade em que você filtra HIGH).
+
+## 3. Cobertura: quantos genes HIGH têm GO
+
+```{r}
+tibble(genes_HIGH = nrow(genes_high),
+       com_GO     = sum(genes_high$gene %in% gene2go$gene))
+```
+
+## 4. Termos GO dos genes HIGH, com nome e ontologia
+
+```{r}
+go_high <- genes_high %>% 
+  inner_join(gene2go, by = "gene")
+
+tabela <- go_high %>%
+  count(ONTOLOGY = category, GO = go_id, TERM = go_term, name = "n_genes") %>%
+  arrange(ONTOLOGY, desc(n_genes))
+
+write_csv(tabela, "GO_genes_HIGH.csv")
+```
+
+## 5. Gráfico: termos mais frequentes por ontologia
+
+#### Cada barra deve ser lida individualmente, como "quantos dos meus genes HIGH têm esse termo"
+
+```{r, fig.width=7, fig.height=11}
+rotulos <- c(biological_process = "Processo biológico",
+             cellular_component = "Componente celular",
+             molecular_function = "Função molecular")
+
+cores <- c(biological_process = "#0072B2",
+           cellular_component = "#009E73",
+           molecular_function = "#D55E00")
+
+p <- tabela %>%
+  group_by(ONTOLOGY) %>% 
+  slice_max(n_genes, n = 15, with_ties = FALSE) %>% 
+  ungroup() %>%
+  ggplot(aes(n_genes, reorder(TERM, n_genes), fill = ONTOLOGY)) +
+  geom_col(width = 0.75) +
+  geom_text(aes(label = n_genes), hjust = -0.15, size = 3) +
+  facet_wrap(~ONTOLOGY, scales = "free_y", ncol = 1,
+             labeller = as_labeller(rotulos)) +
+  scale_fill_manual(values = cores, guide = "none") +
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 45)) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(x = "Nº de genes com variante HIGH", y = NULL) +
+  theme_classic(base_size = 11) +
+  theme(strip.background = element_blank(),
+        strip.text = element_text(face = "bold", hjust = 0),
+        axis.text.y = element_text(color = "black"))
+
+p
+ggsave("GO_genes_HIGH.png", p, width = 7, height = 11, dpi = 300)
+ggsave("GO_genes_HIGH.pdf", p, width = 7, height = 11)
+```
